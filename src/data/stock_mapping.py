@@ -10,7 +10,7 @@ Shared stock code -> name mapping, used by analyzer, data_provider, and name_to_
 from __future__ import annotations
 
 import re
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 # Stock code -> name mapping (common stocks)
 STOCK_NAME_MAP = {
@@ -261,6 +261,50 @@ def foreign_stock_english_aliases(stock_code: str, stock_name: str) -> Tuple[str
         return ()
     aliases = STOCK_ENGLISH_NAME_MAP.get(canonical)
     return tuple(aliases) if aliases else ()
+
+
+# ---------------------------------------------------------------------------
+# Japanese-stock name map (sibling of STOCK_NAME_MAP)
+# ---------------------------------------------------------------------------
+# JP tickers reach the search layer in yfinance form (``7203.T``) together
+# with an English display name (e.g. "TOYOTA MOTOR CORP"), so the default
+# news query would mix that English name with Chinese keywords and miss
+# Japanese headlines entirely. This map is the single source of truth for
+# the Japanese company name used to build Japanese news queries for ``.T``
+# tickers. Keys are the bare TSE code (no ``.T`` suffix); codes not listed
+# here fall back to the pipeline-supplied display name combined with
+# Japanese query keywords.
+STOCK_JP_NAME_MAP: Dict[str, str] = {
+    "7203": "トヨタ自動車",
+    "6758": "ソニーグループ",
+    "9984": "ソフトバンクグループ",
+    "8306": "三菱UFJフィナンシャル・グループ",
+}
+
+
+def is_japanese_stock_code(stock_code: str) -> bool:
+    """Return True for JP tickers in yfinance form (``7203.T``)."""
+    return (stock_code or "").strip().upper().endswith(".T")
+
+
+def canonicalize_japanese_stock_code(stock_code: str) -> str:
+    """Canonicalize a JP ticker to the bare TSE code used as map keys.
+
+    ``7203.T`` -> ``7203``; anything else returns the uppercased stripped
+    input unchanged.
+    """
+    code = (stock_code or "").strip().upper()
+    if code.endswith(".T"):
+        return code[: -len(".T")]
+    return code
+
+
+def japanese_stock_name(stock_code: str) -> Optional[str]:
+    """Return the Japanese company name for a ``.T`` ticker, or None when
+    the ticker is not Japanese or has no entry in STOCK_JP_NAME_MAP."""
+    if not is_japanese_stock_code(stock_code):
+        return None
+    return STOCK_JP_NAME_MAP.get(canonicalize_japanese_stock_code(stock_code))
 
 
 _CONTAINS_CJK_RE = re.compile(r"[\u4e00-\u9fff]")

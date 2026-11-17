@@ -41,7 +41,10 @@ from src.config import (
 )
 from src.data.stock_mapping import (
     canonicalize_foreign_stock_code,
+    canonicalize_japanese_stock_code,
     foreign_stock_english_aliases,
+    is_japanese_stock_code,
+    japanese_stock_name,
 )
 from src.services.run_diagnostics import record_provider_run, record_provider_run_started
 
@@ -2276,6 +2279,7 @@ class SearchService:
     ANALYTICAL_INTEL_LOOKBACK_DAYS = 180
     ANALYTICAL_INTEL_DIMENSIONS = {"market_analysis", "earnings"}
     _CHINESE_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+    _JAPANESE_TEXT_RE = re.compile(r"[\u3040-\u30ff]")
     _US_STOCK_RE = re.compile(r"^[A-Za-z]{1,5}(\.[A-Za-z])?$")
     _DIRECT_NEWS_CATEGORY = "direct_company_news"
     _SECTOR_NEWS_CATEGORY = "sector_related_news"
@@ -2566,6 +2570,18 @@ class SearchService:
         """
         return foreign_stock_english_aliases(stock_code, stock_name)
 
+    @staticmethod
+    def _is_japanese_stock(stock_code: str) -> bool:
+        """判断是否为日本股票（yfinance 形式の ``7203.T`` など）。"""
+        return is_japanese_stock_code(stock_code)
+
+    @staticmethod
+    def _japanese_query_name(stock_code: str, stock_name: str) -> str:
+        """Return the name to embed in Japanese news queries: the canonical
+        Japanese company name from STOCK_JP_NAME_MAP when known, otherwise
+        the pipeline-supplied display name."""
+        return japanese_stock_name(stock_code) or stock_name
+
     @classmethod
     def _contains_chinese_text(cls, value: Optional[str]) -> bool:
         """Return True when the input contains CJK characters."""
@@ -2605,34 +2621,47 @@ class SearchService:
         return cls._contains_chinese_text(" ".join(filter(None, [item.title, item.snippet, item.source])))
 
     @classmethod
+    def _contains_japanese_text(cls, value: Optional[str]) -> bool:
+        """Return True when the input contains hiragana or katakana."""
+        return bool(value and cls._JAPANESE_TEXT_RE.search(value))
+
+    @classmethod
+    def _is_japanese_news_result(cls, item: SearchResult) -> bool:
+        """Heuristic check for Japanese-language news items (kana presence
+        distinguishes Japanese from Chinese CJK text)."""
+        return cls._contains_japanese_text(" ".join(filter(None, [item.title, item.snippet, item.source])))
+
+    @classmethod
     def _prioritize_news_language(
         cls,
         response: SearchResponse,
         *,
         prefer_chinese: bool,
+        prefer_japanese: bool = False,
     ) -> Tuple[SearchResponse, int]:
         """Reorder results by preferred language and return preferred-result count."""
-        if not prefer_chinese or not response.success or not response.results:
+        if not (prefer_chinese or prefer_japanese) or not response.success or not response.results:
             return response, 0
 
-        chinese_results: List[SearchResult] = []
+        is_preferred = cls._is_japanese_news_result if prefer_japanese else cls._is_chinese_news_result
+        preferred_results: List[SearchResult] = []
         other_results: List[SearchResult] = []
         for item in response.results:
-            if cls._is_chinese_news_result(item):
-                chinese_results.append(item)
+            if is_preferred(item):
+                preferred_results.append(item)
             else:
                 other_results.append(item)
 
         return (
             SearchResponse(
                 query=response.query,
-                results=chinese_results + other_results,
+                results=preferred_results + other_results,
                 provider=response.provider,
                 success=response.success,
                 error_message=response.error_message,
                 search_time=response.search_time,
             ),
-            len(chinese_results),
+            len(preferred_results),
         )
 
     @classmethod
@@ -2657,10 +2686,13 @@ class SearchService:
         stock_code: str,
         *,
         prefer_chinese: bool,
+        prefer_japanese: bool = False,
     ) -> Dict[str, str]:
         """Resolve Brave locale hints without forcing US bias onto non-US symbols."""
         if prefer_chinese:
             return {"search_lang": "zh-hans", "country": "CN"}
+        if prefer_japanese:
+            return {"search_lang": "ja", "country": "JP"}
         if cls._is_us_stock(stock_code):
             return {"search_lang": "en", "country": "US"}
         return {}
@@ -4062,9 +4094,18 @@ class SearchService:
         # display name is Chinese (e.g. AAPL -> 苹果), otherwise the foreign
         # branch below is unreachable and English headlines are missed.
         prefer_chinese = prefer_chinese and not (is_foreign and english_aliases)
+        # 日本株（.T）は日本語クエリを優先する。中国語判定は漢字に反応する
+        # ため、日本語名が渡された場合に備えて日本株を先に確定させる。
+        prefer_japanese = self._is_japanese_stock(stock_code)
+        prefer_chinese = prefer_chinese and not prefer_japanese
         if focus_keywords:
             # 如果提供了关键词，直接使用关键词作为查询
             query = " ".join(focus_keywords)
+        elif prefer_japanese:
+            # 日本株：日本語社名（STOCK_JP_NAME_MAP）+ 裸コード + 日本語キーワード
+            jp_name = self._japanese_query_name(stock_code, stock_name)
+            bare_code = canonicalize_japanese_stock_code(stock_code)
+            query = f"{jp_name} {bare_code} 株価 最新ニュース"
         elif prefer_chinese:
             # 指数 target 的 stock_code 可能为空（Agent 工具 _resolve_search_subject
             # 有意只传显示名），空 code 直接省略，避免拼出 "上证50  股票" 双空格。
@@ -4104,7 +4145,7 @@ class SearchService:
         cache_key = self._cache_key(
             (
                 f"{query}|target={stock_code}:{stock_name}|"
-                f"news_pref={'zh' if prefer_chinese else 'default'}"
+                f"news_pref={'ja' if prefer_japanese else 'zh' if prefer_chinese else 'default'}"
             ),
             max_results,
             search_days,
@@ -4145,6 +4186,7 @@ class SearchService:
                         self._brave_search_locale(
                             stock_code,
                             prefer_chinese=prefer_chinese,
+                            prefer_japanese=prefer_japanese,
                         )
                     )
 
@@ -4178,6 +4220,7 @@ class SearchService:
                     language_response, _preferred_count = self._prioritize_news_language(
                         filtered_response,
                         prefer_chinese=prefer_chinese,
+                        prefer_japanese=prefer_japanese,
                     )
                     ranked_response = self._rank_news_response(
                         language_response,
@@ -4335,8 +4378,11 @@ class SearchService:
         Returns:
             SearchResponse 对象
         """
+        is_japanese = self._is_japanese_stock(stock_code)
         if event_types is None:
-            if self._is_foreign_stock(stock_code):
+            if is_japanese:
+                event_types = ["決算短信", "業績予想の修正", "配当予想の修正", "自己株式の取得"]
+            elif self._is_foreign_stock(stock_code):
                 event_types = ["earnings report", "insider selling", "quarterly results"]
             else:
                 event_types = ["年报预告", "减持公告", "业绩快报"]
@@ -4346,6 +4392,8 @@ class SearchService:
         # src/data/stock_mapping.py).
         english_aliases = self._foreign_english_query_terms(stock_code, stock_name)
         effective_name = english_aliases[0] if english_aliases else stock_name
+        if is_japanese:
+            effective_name = self._japanese_query_name(stock_code, stock_name)
 
         # 构建针对性查询
         event_query = " OR ".join(event_types)
@@ -4407,9 +4455,57 @@ class SearchService:
         search_count = 0
 
         is_foreign = self._is_foreign_stock(stock_code)
+        is_japanese = self._is_japanese_stock(stock_code)
         is_index_etf = self.is_index_or_etf(stock_code, stock_name)
 
-        if is_foreign:
+        if is_japanese:
+            jp_name = self._japanese_query_name(stock_code, stock_name)
+            bare_code = canonicalize_japanese_stock_code(stock_code)
+            search_dimensions = [
+                {
+                    'name': 'latest_news',
+                    'query': f"{jp_name} {bare_code} 最新 ニュース 決算",
+                    'desc': '最新消息',
+                    'tavily_topic': 'news',
+                    'strict_freshness': True,
+                },
+                {
+                    'name': 'market_analysis',
+                    'query': f"{jp_name} 目標株価 アナリスト 評価",
+                    'desc': '机构分析',
+                    'tavily_topic': None,
+                    'strict_freshness': False,
+                },
+                {
+                    'name': 'risk_check',
+                    'query': f"{jp_name} リスク 減損 訴訟 不祥事",
+                    'desc': '风险排查',
+                    'tavily_topic': 'news',
+                    'strict_freshness': True,
+                },
+                {
+                    'name': 'announcements',
+                    'query': f"{jp_name} {bare_code} 適時開示 TDnet",
+                    'desc': '公司公告',
+                    'tavily_topic': 'news',
+                    'strict_freshness': True,
+                },
+                {
+                    'name': 'earnings',
+                    'query': f"{jp_name} 決算 業績予想 売上高 営業利益",
+                    'desc': '业绩预期',
+                    'tavily_topic': None,
+                    'strict_freshness': False,
+                },
+                {
+                    'name': 'industry',
+                    'query': f"{jp_name} 業界 競合 市場シェア 見通し",
+                    'desc': '行业分析',
+                    'tavily_topic': None,
+                    'strict_freshness': False,
+                },
+            ]
+        elif is_foreign:
             # Issue #2026: Foreign-ticker English alias resolution from the
             # single source of truth (STOCK_ENGLISH_NAME_MAP in
             # src/data/stock_mapping.py). When STOCK_NAME_MAP maps the ticker
